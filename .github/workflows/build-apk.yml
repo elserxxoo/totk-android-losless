@@ -1,6 +1,7 @@
-name: Build APK Lossless
-# Compila TotK-LSFG.apk (la app con el boton "Lossless Scaling" para importar tu Lossless.dll).
-# No hace falta tocar nada: Actions > "Build APK Lossless" > Run workflow.
+name: Build APK Lossless FIX
+# Corrige el selector de Lossless.dll. Usa el parche que ya esta dentro de build-apk.yml
+# (NO borres ese archivo) y le cambia el codigo de peticion que chocaba (908 -> 920).
+# Uso: Actions > "Build APK Lossless FIX" > Run workflow.
 on:
   workflow_dispatch:
 
@@ -12,8 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
-      - name: Descargar tu repositorio
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
@@ -38,213 +38,42 @@ jobs:
       - name: Instalar dependencias de Python
         run: pip install cryptography==50.0.2
 
-      - name: Anadir el boton Lossless Scaling a la app (parche)
+      - name: Aplicar parche Lossless corregido
         run: |
           set -e
-          cat > "$RUNNER_TEMP/LsfgImport.java" <<'JAVA_EOF'
-          package com.aure.totk.setup;
+          python3 - <<'PY_EOF'
+          import os, subprocess, sys
+          tmp = os.environ['RUNNER_TEMP']
+          lines = open('.github/workflows/build-apk.yml', encoding='utf-8').read().split('\n')
 
-          import java.io.BufferedInputStream;
-          import java.io.File;
-          import java.io.FileOutputStream;
-          import java.io.IOException;
-          import java.io.InputStream;
-          import java.io.OutputStream;
-          import java.io.RandomAccessFile;
+          def heredoc(marker):
+              out, on = [], False
+              for l in lines:
+                  if not on and l.rstrip().endswith("<<'" + marker + "'"):
+                      on = True
+                      continue
+                  if on:
+                      if l.strip() == marker:
+                          break
+                      out.append(l[10:] if l.startswith(' ' * 10) else l.strip())
+              if not out:
+                  sys.exit('No encuentro ' + marker + ' en build-apk.yml (no lo borres ni lo cambies)')
+              return '\n'.join(out) + '\n'
 
-          /** Android-free import of the user's own Lossless.dll into files/lsfg/Lossless.dll. The file name is fixed, never taken
-           * from the source. Until every read, check and the rename succeed, an earlier DLL stays untouched. */
-          final class LsfgImport {
-              static final long MIN_DLL = 256L << 10, MAX_DLL = 512L << 20;
-              static final String NAME = "Lossless.dll";
-
-              static final class Invalid extends IOException {
-                  Invalid(String why) { super(why); }
-              }
-
-              static File dir(File filesDir) { return new File(filesDir, "lsfg"); }
-              static File target(File filesDir) { return new File(dir(filesDir), NAME); }
-
-              /** Owns/closes source. Returns the DLL size in bytes. */
-              static long install(InputStream source, File target) throws IOException {
-                  File parent = target.getParentFile();
-                  if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())
-                      throw new IOException("cannot create " + parent);
-                  File temp = new File(target.getPath() + ".tmp");
-                  try {
-                      long total = 0;
-                      try (InputStream in = new BufferedInputStream(source); OutputStream out = new FileOutputStream(temp)) {
-                          byte[] buffer = new byte[1 << 16];
-                          for (int n; (n = in.read(buffer)) > 0;) {
-                              total += n;
-                              if (total > MAX_DLL) throw new Invalid("too large");
-                              out.write(buffer, 0, n);
-                          }
-                      }
-                      if (total < MIN_DLL) throw new Invalid("too small");
-                      check(temp);
-                      if (target.exists() && !target.delete()) throw new IOException("old DLL could not be replaced");
-                      if (!temp.renameTo(target)) throw new IOException("DLL rename failed");
-                      return total;
-                  } finally {
-                      temp.delete();
-                  }
-              }
-
-              /** A 64-bit x86 Windows DLL: MZ header, PE signature at e_lfanew, machine AMD64, DLL characteristic. */
-              static void check(File file) throws IOException {
-                  try (RandomAccessFile f = new RandomAccessFile(file, "r")) {
-                      byte[] dos = new byte[64];
-                      f.readFully(dos);
-                      if (dos[0] != 'M' || dos[1] != 'Z') throw new Invalid("not a Windows file");
-                      long pe = u32(dos, 60);
-                      if (pe < 64 || pe > f.length() - 24) throw new Invalid("bad header");
-                      f.seek(pe);
-                      byte[] head = new byte[24];
-                      f.readFully(head);
-                      if (head[0] != 'P' || head[1] != 'E' || head[2] != 0 || head[3] != 0) throw new Invalid("not a PE file");
-                      if (u16(head, 4) != 0x8664) throw new Invalid("not 64-bit x86");
-                      if ((u16(head, 22) & 0x2000) == 0) throw new Invalid("not a DLL");
-                  }
-              }
-
-              private static int u16(byte[] b, int p) { return (b[p] & 255) | (b[p + 1] & 255) << 8; }
-              private static long u32(byte[] b, int p) { return (u16(b, p) & 0xffffL) | (long) u16(b, p + 2) << 16; }
-          }
-          JAVA_EOF
-          cat > "$RUNNER_TEMP/apply_lsfg_patch.py" <<'PY_EOF'
-          #!/usr/bin/env python3
-          """Adds a 'Lossless Scaling' import row to the TotK app (Game data screen).
-          Usage: python3 apply_lsfg_patch.py <repo root> <path to LsfgImport.java>
-          Every replacement must match exactly once, otherwise the build stops with a clear message."""
-          import shutil, sys
-          from pathlib import Path
-
-          repo = Path(sys.argv[1])
-          java = repo / "games/totk/android/java/com/aure/totk/setup"
-
-
-          def edit(name, pairs):
-              path = java / name
-              text = path.read_text(encoding="utf-8")
-              for old, new in pairs:
-                  n = text.count(old)
-                  if n != 1:
-                      sys.exit(f"PATCH FAILED in {name}: expected 1 match, found {n} for:\n{old}")
-                  text = text.replace(old, new)
-              path.write_text(text, encoding="utf-8")
-              print("patched", name)
-
-
-          shutil.copyfile(sys.argv[2], java / "LsfgImport.java")
-          print("added LsfgImport.java")
-
-          # ---------------------------------------------------------------- Strings
-          edit("Strings.java", [(
-              '    static final String RERUN = "Run setup again";\n',
-              '''    static final String LSFG_ROW = "Lossless Scaling";
-              static final String LSFG_HINT = "Your own Lossless.dll, used by Frame generation";
-              static final String LSFG_NONE = "Not imported";
-              static final String LSFG_READY = "Imported";
-              static final String LSFG_QUALITY_ROW = "Lossless quality";
-              static final String LSFG_QUALITY_HINT = "Used when Frame generation is On · tap to change";
-              static final String LSFG_BAD = "That file is not a 64-bit Lossless.dll from Lossless Scaling.";
-              static final String LSFG_DONE = "Lossless.dll imported. Set Frame generation to On to use it.";
-              static final String LSFG_TEXT = "Pick the Lossless.dll from your own purchased copy of Lossless Scaling "
-                      + "(Steam: Lossless Scaling folder). It is copied into the app's private storage and never uploaded. "
-                      + "With Frame generation On, the game then uses it instead of the built-in generator. Pick the file again to replace it.";
-              static final String LSFG_QUALITY_TEXT = "Fast uses the lighter model. Better and Best use a higher motion resolution, "
-                      + "which usually reduces ghosting but costs frames per second. Needs the DLL imported and Frame generation On.";
-              static String lsfgQuality(String value) { return "fast".equals(value) ? "Fast" : "best".equals(value) ? "Best" : "Better"; }
-              static final String RERUN = "Run setup again";
-          ''')])
-
-          # ---------------------------------------------------------------- SettingsStore
-          edit("SettingsStore.java", [
-              ('            Settings.writeAtomic(context.getFilesDir(), ENV, settings.env(locale(), StorageLocation.envValue(context)));\n',
-               '            Settings.writeAtomic(context.getFilesDir(), ENV,\n'
-               '                    settings.env(locale(), StorageLocation.envValue(context)) + lsfgEnv(context, settings));\n'),
-              ('    /** Rewrite settings.env (atomic, Settings.writeAtomic).',
-               '''    /** Lossless Scaling engine lines: only with Frame generation On and an imported Lossless.dll. */
-              static String lsfgEnv(Context context, Settings settings) {
-                  if (!"on".equals(settings.get("frame_gen")) || !LsfgImport.target(context.getFilesDir()).isFile()) return "";
-                  String quality = Inputs.prefs(context).getString("lsfgQuality", "better");
-                  String perf = "fast".equals(quality) ? "1" : "0", flow = "best".equals(quality) ? "1.0" : "fast".equals(quality) ? "0.5" : "0.75";
-                  return "TOTK_FRAMEGEN_ENGINE=lsfg\\nTOTK_LSFG_PERF=" + perf + "\\nTOTK_LSFG_FLOW=" + flow + "\\n";
-              }
-              /** Rewrite settings.env (atomic, Settings.writeAtomic).'''),
-          ])
-
-          # ---------------------------------------------------------------- SetupActivity
-          edit("SetupActivity.java", [
-              ('REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;', 'REQ_DATA_FOLDER = 906, REQ_ACCESS = 907, REQ_LSFG = 908;'),
-              ('Widgets.Row row = listRow(parent, "data:" + id, label, hint, 76, 8);',
-               'Widgets.Row row = listRow(parent, "data:" + id, label, hint, 60, 6);'),
-              ('        gameControl(reset, "Changing the driver", this::resetDriver);\n',
-               '''        gameControl(reset, "Changing the driver", this::resetDriver);
-                  File lsfgDll = LsfgImport.target(getFilesDir());
-                  Widgets.Row lsfgRow = dataRow(list, "lsfg", Strings.LSFG_ROW, Strings.LSFG_HINT,
-                          lsfgDll.isFile() ? Strings.LSFG_READY + " · " + Strings.bytes(lsfgDll.length()) : Strings.LSFG_NONE,
-                          lsfgDll.isFile() ? Theme.ZONAI : Theme.AMBER, v -> pickLsfg());
-                  Widgets.Row lsfgQuality = dataRow(list, "lsfg-quality", Strings.LSFG_QUALITY_ROW, Strings.LSFG_QUALITY_HINT,
-                          Strings.lsfgQuality(Inputs.prefs(this).getString("lsfgQuality", "better")), Theme.ZONAI, v -> cycleLsfgQuality());
-                  lsfgRow.dimmed(missing);
-                  lsfgQuality.dimmed(!lsfgDll.isFile());
-                  gameControl(lsfgRow, "Changing Lossless Scaling", this::pickLsfg);
-          '''),
-              ('            case "driver": case "driver-reset": detailText.setText(Strings.DRIVER_TEXT); break;\n',
-               '''            case "driver": case "driver-reset": detailText.setText(Strings.DRIVER_TEXT); break;
-                      case "lsfg": detailText.setText(Strings.LSFG_TEXT); break;
-                      case "lsfg-quality": detailText.setText(Strings.LSFG_QUALITY_TEXT); break;
-          '''),
-              ('    private void confirmDelete() {\n',
-               '''    private void pickLsfg() {
-                  if (!needGameClosed("Changing Lossless Scaling", this::pickLsfg)) return;
-                  Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
-                  try { startActivityForResult(intent, REQ_LSFG); } catch (ActivityNotFoundException noPicker) { showNote(Strings.PICKER_MISSING); }
-              }
-
-              private void cycleLsfgQuality() {
-                  String now = Inputs.prefs(this).getString("lsfgQuality", "better");
-                  String next = "fast".equals(now) ? "better" : "better".equals(now) ? "best" : "fast";
-                  Inputs.prefs(this).edit().putString("lsfgQuality", next).apply();
-                  SettingsStore.writeEnv(this, SettingsStore.load(this));
-                  render();
-              }
-
-              /** Copy the user's own Lossless.dll to files/lsfg/Lossless.dll, where the frame-generation engine looks for it. */
-              private void installLsfg(Uri uri) {
-                  if (!needGameClosed("Changing Lossless Scaling", () -> installLsfg(uri))) return;
-                  ContentResolver resolver = getContentResolver();
-                  worker.execute(() -> {
-                      String outcome = null;
-                      File direct = FileAccess.directFile(this, uri, -1);
-                      try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
-                          held.requireFree();
-                          InputStream in = direct != null ? new java.io.FileInputStream(direct) : resolver.openInputStream(uri);
-                          if (in == null) throw new IOException("unreadable");
-                          LsfgImport.install(in, LsfgImport.target(getFilesDir()));
-                          SettingsStore.writeEnv(this, SettingsStore.load(this));
-                      } catch (LsfgImport.Invalid failed) {
-                          outcome = Strings.LSFG_BAD;
-                      } catch (IOException | SecurityException failed) {
-                          outcome = Strings.gameLockError(failed.toString());
-                      }
-                      String message = outcome;
-                      main.post(() -> { note = message == null ? Strings.LSFG_DONE : message; noteOk = message == null; if (screen == Screen.DATA) render(); });
-                  });
-              }
-
-              private void confirmDelete() {
-          '''),
-              ('        if (request == REQ_DRIVER) { if (data.getData() != null) installDriver(data.getData()); return; }\n',
-               '''        if (request == REQ_DRIVER) { if (data.getData() != null) installDriver(data.getData()); return; }
-                  if (request == REQ_LSFG) { if (data.getData() != null) installLsfg(data.getData()); return; }
-          '''),
-          ])
-          print("OK: all patches applied")
+          java = heredoc('JAVA_EOF')
+          patch = heredoc('PY_EOF')
+          # EL ERROR: 908 es el mismo codigo que usa el instalador de actualizaciones (REQUEST_SOURCES),
+          # asi que al volver del selector la app ignoraba el archivo.
+          assert 'REQ_LSFG = 908' in patch, 'parche inesperado'
+          patch = patch.replace('REQ_LSFG = 908', 'REQ_LSFG = 920')
+          bad = 'outcome = Strings.LSFG_BAD;'
+          assert bad in patch, 'parche inesperado (2)'
+          patch = patch.replace(bad, 'outcome = Strings.LSFG_BAD + " (" + failed.getMessage() + ")";')
+          open(tmp + '/LsfgImport.java', 'w', encoding='utf-8').write(java)
+          open(tmp + '/apply_lsfg_patch.py', 'w', encoding='utf-8').write(patch)
+          subprocess.check_call([sys.executable, tmp + '/apply_lsfg_patch.py', os.getcwd(), tmp + '/LsfgImport.java'])
           PY_EOF
-          python3 "$RUNNER_TEMP/apply_lsfg_patch.py" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/LsfgImport.java"
+          grep -n "REQ_LSFG" games/totk/android/java/com/aure/totk/setup/SetupActivity.java
 
       - name: Obtener el driver Turnip y el traductor del APK oficial v1.0.1
         run: |
@@ -259,18 +88,22 @@ jobs:
           open(tmp + '/totk_xlate', 'wb').write(z.read('lib/arm64-v8a/libtotk_xlate.so'))
           PY_EOF
 
-      - name: Compilar el APK (tarda mucho, es normal)
-        env:
-          KEY_B64: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUcvQUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQnVZd2dnYmlBZ0VBQW9JQmdRQ3VHR0g0QVhzL2lFTDgKeFVDQzY3cnBqSzRjY3JqVGNCSnd4ZEQ3TC9CdnVVVzYzN1RxVXlWekZ4RUx1REpkUlNsTlNMMzAwbUp1TDlWMAo0Zzh3WDBqMHNiaXdGY1VOTFNXa1k4ZVNPUnJkTit1ZG9jYjBOYTlUdWw1ZDFCUVpobXhFMHhCejJhTE5zSll0Clp3TDFhWE5pTVBBRmhqYk1OTGdjS3N1bEhvQXJSYzZnOUtuUUxSamVpT1ZUNHZBK2ExdHJGcjBKU0Q4aFZFWFgKOXV5cmZYbElxRlFNYk9jKzZ2L3MvclZBd094eFpmZ3JNVklvRENaRjFFWkVuTjJ4RDg2YWZhcWlGMG45SFArWAo1UGtUZC9QRnlPaElsbWNnZWcwdDhDamlOMWlnVloxZzhQZHVmenQ0WUpjb0ZQSVJxc05nN0VVMCsrOFdTaEU5CkgwTUsyUzZPLzQvUjZCbjBJeXFVclRkOUdvYk8xa28zWlhMZXdzK3kyNDl5QmI1ZmNuZlNsayttUmNyQ2tOYVYKZm4yMmhjL2FRd0MyL3JVYUViQjk5d09nemtMNExTWnNKTSsrc1h2cWxVT2x5NnlyNGc3THoyVTZTYnlTRFZ6TApvZnhWUnROSyswTm9YckV3QUUzb1Fzb090WGdabE9IZEhCNmlKK2U5RWs4MmNzc2l5NThDQXdFQUFRS0NBWDhKClhSNzdocUszNzNUbC9Dd3RWS2ZnWGhNbXI2SjhXbU5vY2s4R1IxSzYvbU55K0czcUJTeGc4S0dYblZDaUFtVU8KNm5nNVpBTy82WEJDN05JTHRFOWZuczBCY0hrVkZQWVl1Z29WbURmRi9RRHFVaXV3Q3BXZW5Iczd5OG5tZ2Q0OQpOK0hsdTd0QkJpcSs0L0xpVS9FSUw1bWxucm5KOHpOV1VJREs2cDM2TEFJWWZzR1B2NklncE1ZbkM2dEN3K1hyCnlPcllIcytWTm1sUU5GbzNvLzR3d3R6OWYxUXIweFY2cWNKUkNBOWd6dlBZNkxxQ2dKcncxOGpJWGgyMXlzRk8KeU0rRWdZcG5NRW82bFJzcmZkTVNzYjMzejFkMHpkcS9IRlVsQkc0VHZ3ZVB6NWFYKzlWV0RlYUhCUUJuVHYzawpZbWwzUjljUGYvN3J4b3dNSExETHRqWVRhaThCd2tmUDI1N0xvb21OUXVkUkpJanZoZ1hXS3V2a1NmdWJDVkQxCm0xQTBQTkZoY3p6dVpNTGhUN0VmdDl1NktvRnRWenFvUG9GSGs4czJuTkVDYTRTVG5SMnJKQzVwWXJ5MmFnbngKNEdqSnd1ZktXalpZbGRyUndOaWpkVnIyOWpzNmdHL0hEN2xkZUZjTzkxMFZlUmdmZFhQZnI2VnBkOGVtcVFLQgp3UUR5SnBUM1VxUTBjaWNLVis0bmY0c05NKzdST3I3Qzg4ZHhrYXB3QVhhdmh1RWhMV3pMa1NKYlI5QXFhajJGCi9qS0o2NjBCNGszV0RPbS81UDZISldJNXMrZWdhOVA3Z2pHZkJURkoyMmVHbXhXNzUvd1orSGYwWE5nOTIvbFMKaDRZb2ZHQ0ZPTmZDVUdKYU5HUm8zWld6eTJGa1FZWWcvTEl2U1FhV1MxYzhtWU45NWxuS21LN0JNb0tyTDFzVQpsUVVhUmxQNUNYSGtNb05ydU94QWt1bTJWa1l2dFpzckxFMTNNc0ZiaHpYN0lLL0NUSHNtVXZrODRuZ3VaYnFtClM3MENnY0VBdUExZ0pDcUpjTDFzcmZUd0VBMzNRTkF3WHNzc3RsaHpSbEFtd0JXL1NuNFh4azVXeDMzQnBaOGEKa1FmWGxhUEpMUGdVaThQWjFjMzc2SE5hWmtrZUl1alllam56dzFuWGRxaVJwcUxFa2cyTjE1Y1p4LzZaL0wzWgoybkMvMis5QjFRSkZtUFE2ZE5VaFY1ZFRKRU45MjUvL2NjQUJudnA5b1drdlhzcCtwRW9rODl2OGM4dVJrVXZOCmxJblI2TjNROWxOSmkwNlI4SkhjSHdZNUxwVHlCeDA4M1BRWm9XT0YrYTRKV2NMQmxwejVaVnRZREFJQ0QzdjcKMG5IbU94eUxBb0hBTzF1cnpvaXFpZFNscjBwb3JiUDlJUXBtODFFRUxBUFlFd1hURXN1NURVUHg4ZEVSeDBEWApmQ3E1WTN4UmdvUVNYVzZ4SlRJVlJIQTc2SGM0MFdZZmt1ZC8wdm83cDM1OXJXNTNhNVJsNTBBaTdzSHFNVytQCjhBM0dVRHVZL1ZzTlR1VldQN0gwYWNTTXAzSUtYdzVhUVEyTTNTZVd1b1ZYSkhJeE5DeFp3UmdjZklNMzVZclIKNDdmL0FmbUV5U0hTYzJOaitEc1JlUS9NMlY0bVE1bi93bHVacnQ1RW9DdW0vWjRxZWNaR1BENEI5NDRKN2hZTwoxSmJyUU94YythQzlBb0hBWUpsOGxWN1NCaDhWbEhQVEw4bjB0TXJRS0dDZzFnKzBhUG9XYklpOWZyNlJnZDZLCkEyaElvOEhPOHNIWDc4MG9BSGN3YVc3Z3ZTdkFoRzlPeWhLa1E1Uk1VbEpxVTJTckJyZFF3dEg1TStMelNHMGcKOWV2MkxFWUV1bmFrN0MwMk16TmZEZmxaV1FxbjFrNHhMLzVRWjE0aGR6VmNaSEY2VUtaaFczSVNaKzRXV1B0awpFKzZMTjJRK3dUQll3TXp6S09YcjJyYmhPQStHSmE1aGdzWmdCVVhlTk9YVk1mU0hVOVY1U09oRUxPVzBxL0wyClVrOFhmOE1HRjV6NlJwb2pBb0hCQUtDWmo2ZzhHZDZhUlp6WDZLYU15UEYwVHk5ekI2dmhFbk5IbDJqRVNrT0wKQkJKaGhwRStFMk54cVdPcEwxazF6aHRnSUl2UHZRNmJteWw0a1EvVGJucWFxNGxPMytxaUhsN3V3a1hOWW5vawpmaGNRQVVXY2lVV3owSTdOWExLRUs4L1NkSWVNN2pwV1N0Zy84L3B1aTR3MXc4RjRFN0VQSmgzMWliQkp4N3RyCkNMWEdJbHIraVVkWWlYZ3lURjhuMGd4cmwwajZzd0Z2UW43Vy95S1gzcFRucVhmTndEUzd5SkZqZFdpbXhMNlAKNFN2a24yaDNWb2g2MFpvRUdrbkpSQT09Ci0tLS0tRU5EIFBSSVZBVEUgS0VZLS0tLS0KLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVNVENDQXBtZ0F3SUJBZ0lVY05OSE91aVRsRDJFc0QvUDA3RzFZMUw2aC9vd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0p6RWxNQ01HQTFVRUF3d2NWRzkwU3lCTWIzTnpiR1Z6Y3lCd1pYSnpiMjVoYkNCaWRXbHNaREFnRncweQpOakV4TVRrd05qQXlNekphR0E4eU1USTJNVEF5TmpBMk1ESXpNbG93SnpFbE1DTUdBMVVFQXd3Y1ZHOTBTeUJNCmIzTnpiR1Z6Y3lCd1pYSnpiMjVoYkNCaWRXbHNaRENDQWFJd0RRWUpLb1pJaHZjTkFRRUJCUUFEZ2dHUEFEQ0MKQVlvQ2dnR0JBSzRZWWZnQmV6K0lRdnpGUUlMcnV1bU1yaHh5dU5Od0VuREYwUHN2OEcrNVJicmZ0T3BUSlhNWApFUXU0TWwxRktVMUl2ZlRTWW00djFYVGlEekJmU1BTeHVMQVZ4UTB0SmFSang1STVHdDAzNjUyaHh2UTFyMU82ClhsM1VGQm1HYkVUVEVIUFpvczJ3bGkxbkF2VnBjMkl3OEFXR05zdzB1QndxeTZVZWdDdEZ6cUQwcWRBdEdONkkKNVZQaThENXJXMnNXdlFsSVB5RlVSZGYyN0t0OWVVaW9WQXhzNXo3cS8reit0VURBN0hGbCtDc3hVaWdNSmtYVQpSa1NjM2JFUHpwcDlxcUlYU2YwYy81ZmsrUk4zODhYSTZFaVdaeUI2RFMzd0tPSTNXS0JWbldEdzkyNS9PM2hnCmx5Z1U4aEdxdzJEc1JUVDc3eFpLRVQwZlF3clpMbzcvajlIb0dmUWpLcFN0TjMwYWhzN1dTamRsY3Q3Q3o3TGIKajNJRnZsOXlkOUtXVDZaRnlzS1ExcFYrZmJhRno5cERBTGIrdFJvUnNIMzNBNkRPUXZndEptd2t6NzZ4ZStxVgpRNlhMckt2aURzdlBaVHBKdkpJTlhNdWgvRlZHMDByN1EyaGVzVEFBVGVoQ3lnNjFlQm1VNGQwY0hxSW41NzBTClR6Wnl5eUxMbndJREFRQUJvMU13VVRBZEJnTlZIUTRFRmdRVWZPbUIwVTl1Y1lOQ3d1dnh6Z1RiVHkrSlE1RXcKSHdZRFZSMGpCQmd3Rm9BVWZPbUIwVTl1Y1lOQ3d1dnh6Z1RiVHkrSlE1RXdEd1lEVlIwVEFRSC9CQVV3QXdFQgovekFOQmdrcWhraUc5dzBCQVFzRkFBT0NBWUVBcVJ4Q084L3hibHlJMzZ1VGU1VmNJZTl1NG9hUnVhbUh6VFZFCm5KbTV5clZhRytUTCtleWozSHZCYVZOVDc0SG4xdlJna0gvcEJ3WUdESXRJZVo2a00rN2toMEcwcmtWYkJmRUgKYTgyOU1BUVRoNk02YnhXTUt3RG84MU9VL3g3aGhxZVJSdm1qZU12eW0rZmJGVEt4RFJnK28yL1laWnF4THNaSwpKRDN0MURwQ0VobXluSVpsMXd6TXBjRE50VWJWUWQzcjZwaDFNUi9WdTBTYm1jK3FuU1lvUTZxNk1VN1d6VjdzClhRdzcxTnBDMjZDdVppeDZtaVlmcGgvN3JEUFFZWFlXbUUzTlpjQWtKQjlHTzRuN1BReHlpcTUyRWR0aS9KTEgKMEZ4V3ZPRjFybWVJMHJ6Qm9vOFFPTEZ2ZGh3NHZyRDRQYVljKzZkY1B3aWtVSmIxVno0K0orMk52QWY1R3hmWAptdHA3NVRwQzJuMSs4ZHdITmpGa0p3Q0dJYVJPbTdZcGkzdUIrMktJZFg4MHNpZzhDaDhuTTBwS1BVejBWTnQzCmdzZlQ5TkpXTEF0ZkFFcTFQQVNweHBrWlRBbE5oeTZnUFhuVWE5WmIvRUN1VSs0c0V4OU05bXdTcktYcjBaaFQKQ3paVEhNSExFV1YzZy9JdUhJbnJaTEZGSVdZbgotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==
+      - name: Clave de firma (la misma de build-apk.yml, asi se actualiza encima)
         run: |
           set -e
+          KEY_B64=$(grep -m1 -E '^[[:space:]]*KEY_B64:' .github/workflows/build-apk.yml | sed -E 's/^[[:space:]]*KEY_B64:[[:space:]]*//' | tr -d "\"' \r")
           echo "$KEY_B64" | base64 -d > "$RUNNER_TEMP/personal.pem"
+          grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/personal.pem" || { echo "::error::No encuentro la clave en build-apk.yml"; exit 1; }
+
+      - name: Compilar el APK (tarda mucho, es normal)
+        run: |
+          set -e
           python3 games/totk/android/build_release.py \
             --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
             --turnip "$RUNNER_TEMP/driver.so" \
             --translator "$RUNNER_TEMP/totk_xlate" \
             --key "$RUNNER_TEMP/personal.pem" \
-            --version-name 1.0.1-lsfg \
+            --version-name 1.0.1-lsfg2 \
             --work "$RUNNER_TEMP/work" \
             -o "$GITHUB_WORKSPACE/TotK-LSFG.apk" \
             --jobs "$(nproc)"
@@ -287,4 +120,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete lsfg-latest --yes --cleanup-tag || true
-          gh release create lsfg-latest TotK-LSFG.apk --title "TotK-LSFG (Lossless Scaling)" --notes "APK con importador de Lossless.dll. Descargalo y instalalo en tu consola." --target "$GITHUB_SHA"
+          gh release create lsfg-latest TotK-LSFG.apk --title "TotK-LSFG (Lossless Scaling)" --notes "APK con importador de Lossless.dll corregido: el selector de archivos ya funciona." --target "$GITHUB_SHA"
