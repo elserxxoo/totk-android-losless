@@ -177,7 +177,7 @@ jobs:
 
           # ---------------------------------------------------------------- SetupActivity
           edit("SetupActivity.java", [
-              ('REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;', 'REQ_DATA_FOLDER = 906, REQ_ACCESS = 907, REQ_LSFG = 908;'),
+              ('REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;', 'REQ_DATA_FOLDER = 906, REQ_ACCESS = 907, REQ_LSFG = 920;'),
               ('Widgets.Row row = listRow(parent, "data:" + id, label, hint, 76, 8);',
                'Widgets.Row row = listRow(parent, "data:" + id, label, hint, 60, 6);'),
               ('        gameControl(reset, "Changing the driver", this::resetDriver);\n',
@@ -226,7 +226,7 @@ jobs:
                           LsfgImport.install(in, LsfgImport.target(getFilesDir()));
                           SettingsStore.writeEnv(this, SettingsStore.load(this));
                       } catch (LsfgImport.Invalid failed) {
-                          outcome = Strings.LSFG_BAD;
+                          outcome = Strings.LSFG_BAD + " (" + failed.getMessage() + ")";
                       } catch (IOException | SecurityException failed) {
                           outcome = Strings.gameLockError(failed.toString());
                       }
@@ -270,7 +270,7 @@ jobs:
             --turnip "$RUNNER_TEMP/driver.so" \
             --translator "$RUNNER_TEMP/totk_xlate" \
             --key "$RUNNER_TEMP/personal.pem" \
-            --version-name 1.0.1-lsfg \
+            --version-name 1.0.1-lsfg2 \
             --work "$RUNNER_TEMP/work" \
             -o "$GITHUB_WORKSPACE/TotK-LSFG.apk" \
             --jobs "$(nproc)"
@@ -287,4 +287,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete lsfg-latest --yes --cleanup-tag || true
-          gh release create lsfg-latest TotK-LSFG.apk --title "TotK-LSFG (Lossless Scaling)" --notes "APK con importador de Lossless.dll. Descargalo y instalalo en tu consola." --target "$GITHUB_SHA"
+          gh release create lsfg-latest TotK-LSFG.apk --title "TotK-LSFG (Lossless Scaling)" --notes "APK con importador de Lossless.dll corregido: el selector de archivos ya funciona. Descargalo y instalalo en tu consola." --target "$GITHUB_SHA"
